@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# SQLite runtime cache
+*.db-wal
+*.db-shm
+
+# System Logs
+*.log
+ansible_self_healing.log
+
+# Environment & Editor
+.env
+.env.local
+.vscode/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,25 @@
+{
+  "name": "server-monitoring-app",
+  "version": "1.0.0",
+  "description": "ServerPulse - Real-time Server Monitoring and Observability Platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "monitoring",
+    "server",
+    "dashboard",
+    "telemetry",
+    "uptime",
+    "observability"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
