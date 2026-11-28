@@ -1,0 +1,32 @@
+[build]
+  publish = "public"
+
+[[headers]]
+  for = "/config.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+# Ganti YOUR-RENDER-APP.onrender.com dengan URL Web Service Render Anda setelah deploy
+[[redirects]]
+  from = "/api/*"
+  to = "https://YOUR-RENDER-APP.onrender.com/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/webhook"
+  to = "https://YOUR-RENDER-APP.onrender.com/webhook"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/install.sh"
+  to = "https://YOUR-RENDER-APP.onrender.com/install.sh"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/agent/*"
+  to = "https://YOUR-RENDER-APP.onrender.com/agent/:splat"
+  status = 200
+  force = true

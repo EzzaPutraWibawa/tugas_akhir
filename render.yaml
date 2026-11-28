@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: serverpulse-cyber-soc
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ENABLE_BACKGROUND_WORKERS
+        value: "true"
+      - key: ENABLE_TAILSCALE_BRIDGE
+        value: "false"
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://tugas-akhir-113.netlify.app,https://agent-6b0af3e7da12609e0abf0491--tugas-akhir-113.netlify.app
+      - key: PUBLIC_DASHBOARD_URL
+        value: https://tugas-akhir-113.netlify.app

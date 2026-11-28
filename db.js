@@ -1,19 +1,42 @@
-const { DatabaseSync } = require('node:sqlite');
+const { createClient } = require('@libsql/client');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 
-const dbPath = path.join(__dirname, 'serverpulse.db');
-const db = new DatabaseSync(dbPath);
+// Load .env early when db.js is imported standalone (e.g. migration/test scripts)
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath) && typeof process.loadEnvFile === 'function') {
+  try {
+    process.loadEnvFile(envPath);
+  } catch (_) {}
+}
 
-// WAL mode and 10s busy timeout for high-concurrency resilience
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA busy_timeout = 10000;');
-db.exec('PRAGMA synchronous = NORMAL;');
+const localDbPath = path.join(__dirname, 'serverpulse.db');
+const configuredUrl = (process.env.TURSO_DATABASE_URL || '').trim();
+const dbUrl = configuredUrl || `file:${localDbPath}`;
+const isLocalFile = dbUrl.startsWith('file:');
 
-// Initialize schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS admin_users (
+const client = createClient({
+  url: dbUrl,
+  authToken: (process.env.TURSO_AUTH_TOKEN || '').trim() || undefined
+});
+
+async function queryAll(sql, args = []) {
+  const res = await client.execute({ sql, args });
+  return res.rows.map((row) => ({ ...row }));
+}
+
+async function queryGet(sql, args = []) {
+  const res = await client.execute({ sql, args });
+  return res.rows[0] ? { ...res.rows[0] } : null;
+}
+
+async function queryRun(sql, args = []) {
+  return client.execute({ sql, args });
+}
+
+const SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS admin_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
@@ -22,33 +45,30 @@ db.exec(`
     role TEXT DEFAULT 'superadmin',
     last_login INTEGER,
     created_at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS admin_sessions (
+  )`,
+  `CREATE TABLE IF NOT EXISTS admin_sessions (
     token TEXT PRIMARY KEY,
     username TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_sessions_token ON admin_sessions(token);
-  CREATE INDEX IF NOT EXISTS idx_admin_username ON admin_users(username);
-
-  CREATE TABLE IF NOT EXISTS servers (
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_sessions_token ON admin_sessions(token)`,
+  `CREATE INDEX IF NOT EXISTS idx_admin_username ON admin_users(username)`,
+  `CREATE TABLE IF NOT EXISTS servers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    type TEXT NOT NULL,              -- 'agent' or 'probe'
-    target TEXT,                     -- URL or Host:Port for probes, Hostname for agent
-    probe_type TEXT DEFAULT 'http',  -- 'http', 'tcp', 'ping'
-    token TEXT UNIQUE,               -- Secret token for agent auth
-    status TEXT DEFAULT 'offline',   -- 'online', 'degraded', 'offline'
+    type TEXT NOT NULL,
+    target TEXT,
+    probe_type TEXT DEFAULT 'http',
+    token TEXT UNIQUE,
+    status TEXT DEFAULT 'offline',
     last_heartbeat INTEGER,
     created_at INTEGER,
-    os_info TEXT,                    -- JSON string with platform, arch, cpu model, etc.
-    tags TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS metrics (
+    os_info TEXT,
+    tags TEXT,
+    netdata_url TEXT DEFAULT 'http://localhost:19999'
+  )`,
+  `CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id TEXT NOT NULL,
     timestamp INTEGER NOT NULL,
@@ -60,44 +80,41 @@ db.exec(`
     net_rx_kb REAL DEFAULT 0,
     net_tx_kb REAL DEFAULT 0,
     response_time_ms REAL DEFAULT 0,
-    top_processes TEXT,              -- JSON string
+    top_processes TEXT,
     FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_metrics_server ON metrics(server_id, timestamp);
-
-  CREATE TABLE IF NOT EXISTS incidents (
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_metrics_server ON metrics(server_id, timestamp)`,
+  `CREATE TABLE IF NOT EXISTS incidents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id TEXT NOT NULL,
     server_name TEXT NOT NULL,
-    event_type TEXT NOT NULL,        -- 'offline', 'high_cpu', 'high_ram', 'recovered'
+    event_type TEXT NOT NULL,
     details TEXT,
     started_at INTEGER NOT NULL,
     resolved_at INTEGER,
     duration_seconds INTEGER
-  );
-
-  CREATE TABLE IF NOT EXISTS settings (
+  )`,
+  `CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-  );
-
-  -- Closed-Loop DDoS & Attacker Intelligence Tables
-  CREATE TABLE IF NOT EXISTS ddos_incidents (
+  )`,
+  `CREATE TABLE IF NOT EXISTS ddos_incidents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id TEXT UNIQUE NOT NULL,
+    server_id TEXT DEFAULT 'local-host',
+    server_ip TEXT DEFAULT '127.0.0.1',
     attack_type TEXT NOT NULL,
     mitigation_level INTEGER DEFAULT 1,
     confidence_score REAL DEFAULT 0,
-    status TEXT DEFAULT 'ACTIVE',       -- 'ACTIVE', 'MITIGATED', 'SELF_HEALED'
+    status TEXT DEFAULT 'ACTIVE',
     ai_summary TEXT,
     health_probe TEXT,
     created_at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS attacker_profiles (
+  )`,
+  `CREATE TABLE IF NOT EXISTS attacker_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id TEXT NOT NULL,
+    server_id TEXT DEFAULT 'local-host',
     ip_address TEXT NOT NULL,
     country TEXT DEFAULT 'Unknown',
     country_code TEXT DEFAULT 'XX',
@@ -116,39 +133,53 @@ db.exec(`
     attack_hour INTEGER DEFAULT 0,
     action_taken TEXT DEFAULT 'BLOCKED',
     created_at INTEGER NOT NULL
-  );
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_attackers_incident ON attacker_profiles(incident_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_attackers_ip ON attacker_profiles(ip_address)`
+];
 
-  CREATE INDEX IF NOT EXISTS idx_attackers_incident ON attacker_profiles(incident_id);
-  CREATE INDEX IF NOT EXISTS idx_attackers_ip ON attacker_profiles(ip_address);
-`);
-
-// Safe Migration for existing databases
-function migrateSchema() {
-  const columns = [
-    { name: 'device_os', type: 'TEXT DEFAULT "Windows 11"' },
-    { name: 'device_type', type: 'TEXT DEFAULT "desktop"' },
-    { name: 'target_port', type: 'INTEGER DEFAULT 80' },
-    { name: 'asn_number', type: 'TEXT DEFAULT "AS-UNKNOWN"' },
-    { name: 'asn_org', type: 'TEXT DEFAULT "Unknown Provider"' },
-    { name: 'day_name', type: 'TEXT DEFAULT "Rabu"' },
-    { name: 'attack_date', type: 'TEXT DEFAULT ""' },
-    { name: 'attack_time', type: 'TEXT DEFAULT ""' },
-    { name: 'attack_hour', type: 'INTEGER DEFAULT 0' }
-  ];
+async function ensureMissingColumns(tableName, columns) {
+  const existingCols = await queryAll(`PRAGMA table_info(${tableName})`);
+  const existingNames = new Set(existingCols.map((c) => c.name));
 
   for (const col of columns) {
-    try {
-      db.exec(`ALTER TABLE attacker_profiles ADD COLUMN ${col.name} ${col.type}`);
-    } catch (_) {
-      // Column already exists, ignore
+    if (!existingNames.has(col.name)) {
+      try {
+        await queryRun(`ALTER TABLE ${tableName} ADD COLUMN ${col.name} ${col.type}`);
+      } catch (_) {}
     }
   }
-
-  try {
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_attackers_device ON attacker_profiles(device_os)`);
-  } catch (_) {}
 }
-migrateSchema();
+
+async function migrateSchema() {
+  await ensureMissingColumns('attacker_profiles', [
+    { name: 'device_os', type: "TEXT DEFAULT 'Windows 11'" },
+    { name: 'device_type', type: "TEXT DEFAULT 'desktop'" },
+    { name: 'target_port', type: 'INTEGER DEFAULT 80' },
+    { name: 'asn_number', type: "TEXT DEFAULT 'AS-UNKNOWN'" },
+    { name: 'asn_org', type: "TEXT DEFAULT 'Unknown Provider'" },
+    { name: 'day_name', type: "TEXT DEFAULT 'Rabu'" },
+    { name: 'attack_date', type: "TEXT DEFAULT ''" },
+    { name: 'attack_time', type: "TEXT DEFAULT ''" },
+    { name: 'attack_hour', type: 'INTEGER DEFAULT 0' },
+    { name: 'server_id', type: "TEXT DEFAULT 'local-host'" }
+  ]);
+
+  await ensureMissingColumns('servers', [
+    { name: 'netdata_url', type: "TEXT DEFAULT 'http://localhost:19999'" }
+  ]);
+
+  await ensureMissingColumns('ddos_incidents', [
+    { name: 'server_id', type: "TEXT DEFAULT 'local-host'" },
+    { name: 'server_ip', type: "TEXT DEFAULT '127.0.0.1'" }
+  ]);
+
+  await client.batch([
+    'CREATE INDEX IF NOT EXISTS idx_attackers_device ON attacker_profiles(device_os)',
+    'CREATE INDEX IF NOT EXISTS idx_attackers_server ON attacker_profiles(server_id)',
+    'CREATE INDEX IF NOT EXISTS idx_ddos_inc_server ON ddos_incidents(server_id)'
+  ], 'write');
+}
 
 // Cryptographic Password Hashing Helpers
 function hashPassword(password, salt) {
@@ -166,27 +197,48 @@ function verifyPassword(password, salt, storedHash) {
   }
 }
 
-// Seed default administrator if none exists
-function seedDefaultAdmin() {
-  const existing = db.prepare('SELECT id FROM admin_users WHERE username = ?').get('admin');
+async function seedDefaultAdmin() {
+  const existing = await queryGet('SELECT id FROM admin_users WHERE username = ?', ['admin']);
   if (!existing) {
+    const defaultPassword = process.env.ADMIN_DEFAULT_PASSWORD || 'admin123';
     const salt = crypto.randomBytes(16).toString('hex');
-    const hash = hashPassword('admin123', salt);
-    db.prepare(`
-      INSERT INTO admin_users (username, password_hash, salt, full_name, role, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run('admin', hash, salt, 'Chief Security Officer', 'superadmin', Date.now());
-    console.log('[Auth] Akun Administrator bawaan berhasil dibuat (admin / admin123)');
+    const hash = hashPassword(defaultPassword, salt);
+    await queryRun(
+      `INSERT INTO admin_users (username, password_hash, salt, full_name, role, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ['admin', hash, salt, 'Chief Security Officer', 'superadmin', Date.now()]
+    );
+    console.log('[Auth] Akun Administrator bawaan berhasil dibuat (admin)');
   }
 }
-seedDefaultAdmin();
+
+const DEFAULT_SETTINGS = [
+  ['alert_cpu_threshold', '85'],
+  ['alert_ram_threshold', '90'],
+  ['alert_disk_threshold', '90'],
+  ['telegram_bot_token', ''],
+  ['telegram_chat_id', ''],
+  ['discord_webhook_url', ''],
+  ['probe_interval_seconds', '10'],
+  ['offline_timeout_seconds', '25'],
+  ['closed_loop_mode', 'auto'],
+  ['netdata_host', 'http://localhost:19999']
+];
+
+async function seedDefaultSettings() {
+  const stmts = DEFAULT_SETTINGS.map(([key, val]) => ({
+    sql: 'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)',
+    args: [key, val]
+  }));
+  await client.batch(stmts, 'write');
+}
 
 // Indonesian Date & Time Formatting Helper
 function getIndonesianDateTime(timestamp = Date.now()) {
   const d = new Date(timestamp);
   const days = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
   const day_name = days[d.getDay()];
-  
+
   const pad = (n) => String(n).padStart(2, '0');
   const year = d.getFullYear();
   const month = pad(d.getMonth() + 1);
@@ -202,88 +254,101 @@ function getIndonesianDateTime(timestamp = Date.now()) {
   return { day_name, attack_date, attack_time, attack_hour };
 }
 
-// Default settings if not set
-const defaultSettings = [
-  ['alert_cpu_threshold', '85'],
-  ['alert_ram_threshold', '90'],
-  ['alert_disk_threshold', '90'],
-  ['telegram_bot_token', ''],
-  ['telegram_chat_id', ''],
-  ['discord_webhook_url', ''],
-  ['probe_interval_seconds', '10'],
-  ['offline_timeout_seconds', '25'],
-  ['closed_loop_mode', 'auto'],
-  ['netdata_host', 'http://localhost:19999']
-];
+let initPromise = null;
 
-for (const [key, val] of defaultSettings) {
-  const existing = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-  if (!existing) {
-    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run(key, val);
-  }
-}
-
-// Database helper functions
+// Database helper functions (async, dual-mode: local SQLite file or Turso cloud)
 const DB = {
-  getServers() {
-    return db.prepare('SELECT * FROM servers ORDER BY created_at DESC').all();
+  getConnectionInfo() {
+    return {
+      mode: isLocalFile ? 'local-sqlite' : 'turso-cloud',
+      isLocalFile
+    };
   },
 
-  getServerById(id) {
-    return db.prepare('SELECT * FROM servers WHERE id = ?').get(id);
+  getClient() {
+    return client;
   },
 
-  getServerByToken(token) {
+  init() {
+    if (!initPromise) {
+      initPromise = (async () => {
+        if (isLocalFile) {
+          await queryRun('PRAGMA journal_mode = WAL;');
+          await queryRun('PRAGMA busy_timeout = 10000;');
+          await queryRun('PRAGMA synchronous = NORMAL;');
+        }
+        await client.batch(SCHEMA_STATEMENTS, 'write');
+        await migrateSchema();
+        await seedDefaultAdmin();
+        await seedDefaultSettings();
+      })().catch((err) => {
+        initPromise = null;
+        throw err;
+      });
+    }
+    return initPromise;
+  },
+
+  async getServers() {
+    return queryAll('SELECT * FROM servers ORDER BY created_at DESC');
+  },
+
+  async getServerById(id) {
+    return queryGet('SELECT * FROM servers WHERE id = ?', [id]);
+  },
+
+  async getServerByToken(token) {
     if (!token) return null;
-    return db.prepare('SELECT * FROM servers WHERE token = ?').get(token);
+    return queryGet('SELECT * FROM servers WHERE token = ?', [token]);
   },
 
-  createServer(server) {
-    const stmt = db.prepare(`
-      INSERT INTO servers (id, name, type, target, probe_type, token, status, last_heartbeat, created_at, os_info, tags)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      server.id,
-      server.name,
-      server.type,
-      server.target || '',
-      server.probe_type || 'http',
-      server.token || null,
-      server.status || 'offline',
-      server.last_heartbeat || null,
-      server.created_at || Date.now(),
-      server.os_info ? (typeof server.os_info === 'string' ? server.os_info : JSON.stringify(server.os_info)) : null,
-      server.tags || ''
+  async createServer(server) {
+    await queryRun(
+      `INSERT INTO servers (id, name, type, target, probe_type, token, status, last_heartbeat, created_at, os_info, tags, netdata_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        server.id,
+        server.name,
+        server.type,
+        server.target || '',
+        server.probe_type || 'http',
+        server.token || null,
+        server.status || 'offline',
+        server.last_heartbeat || null,
+        server.created_at || Date.now(),
+        server.os_info ? (typeof server.os_info === 'string' ? server.os_info : JSON.stringify(server.os_info)) : null,
+        server.tags || '',
+        server.netdata_url || 'http://localhost:19999'
+      ]
     );
     return this.getServerById(server.id);
   },
 
-  updateServerStatus(id, status, lastHeartbeat = Date.now(), osInfo = null) {
+  async updateServerStatus(id, status, lastHeartbeat = Date.now(), osInfo = null) {
     if (osInfo) {
       const osStr = typeof osInfo === 'string' ? osInfo : JSON.stringify(osInfo);
-      db.prepare(`
-        UPDATE servers 
-        SET status = ?, last_heartbeat = ?, os_info = ?
-        WHERE id = ?
-      `).run(status, lastHeartbeat, osStr, id);
+      await queryRun(
+        `UPDATE servers SET status = ?, last_heartbeat = ?, os_info = ? WHERE id = ?`,
+        [status, lastHeartbeat, osStr, id]
+      );
     } else {
-      db.prepare(`
-        UPDATE servers 
-        SET status = ?, last_heartbeat = ?
-        WHERE id = ?
-      `).run(status, lastHeartbeat, id);
+      await queryRun(
+        `UPDATE servers SET status = ?, last_heartbeat = ? WHERE id = ?`,
+        [status, lastHeartbeat, id]
+      );
     }
   },
 
-  deleteServer(id) {
-    db.prepare('DELETE FROM metrics WHERE server_id = ?').run(id);
-    db.prepare('DELETE FROM incidents WHERE server_id = ?').run(id);
-    db.prepare('DELETE FROM servers WHERE id = ?').run(id);
+  async deleteServer(id) {
+    await client.batch([
+      { sql: 'DELETE FROM metrics WHERE server_id = ?', args: [id] },
+      { sql: 'DELETE FROM incidents WHERE server_id = ?', args: [id] },
+      { sql: 'DELETE FROM servers WHERE id = ?', args: [id] }
+    ], 'write');
   },
 
   // Save metrics snapshot
-  saveMetrics(serverIdOrMetrics, maybeMetrics) {
+  async saveMetrics(serverIdOrMetrics, maybeMetrics) {
     let serverId = serverIdOrMetrics;
     let metrics = maybeMetrics;
 
@@ -294,54 +359,54 @@ const DB = {
 
     if (!metrics) return;
 
-    const stmt = db.prepare(`
-      INSERT INTO metrics (
-        server_id, timestamp, cpu_percent, memory_percent, 
-        memory_used_gb, memory_total_gb, disk_percent, 
-        net_rx_kb, net_tx_kb, response_time_ms, top_processes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    stmt.run(
-      serverId,
-      metrics.timestamp || Date.now(),
-      metrics.cpu_percent || 0,
-      metrics.memory_percent || 0,
-      metrics.memory_used_gb || 0,
-      metrics.memory_total_gb || 0,
-      metrics.disk_percent || 0,
-      metrics.net_rx_kb || 0,
-      metrics.net_tx_kb || 0,
-      metrics.response_time_ms || 0,
-      metrics.top_processes ? (typeof metrics.top_processes === 'string' ? metrics.top_processes : JSON.stringify(metrics.top_processes)) : null
-    );
-
-    // Keep database lean: purge records older than 7 days
     const sevenDaysAgo = Date.now() - (7 * 24 * 3600 * 1000);
-    db.prepare('DELETE FROM metrics WHERE timestamp < ?').run(sevenDaysAgo);
+    await client.batch([
+      {
+        sql: `INSERT INTO metrics (
+          server_id, timestamp, cpu_percent, memory_percent,
+          memory_used_gb, memory_total_gb, disk_percent,
+          net_rx_kb, net_tx_kb, response_time_ms, top_processes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          serverId,
+          metrics.timestamp || Date.now(),
+          metrics.cpu_percent || 0,
+          metrics.memory_percent || 0,
+          metrics.memory_used_gb || 0,
+          metrics.memory_total_gb || 0,
+          metrics.disk_percent || 0,
+          metrics.net_rx_kb || 0,
+          metrics.net_tx_kb || 0,
+          metrics.response_time_ms || 0,
+          metrics.top_processes
+            ? (typeof metrics.top_processes === 'string' ? metrics.top_processes : JSON.stringify(metrics.top_processes))
+            : null
+        ]
+      },
+      {
+        sql: 'DELETE FROM metrics WHERE timestamp < ?',
+        args: [sevenDaysAgo]
+      }
+    ], 'write');
   },
 
-  getLatestMetrics(serverId) {
-    return db.prepare(`
-      SELECT * FROM metrics 
-      WHERE server_id = ? 
-      ORDER BY timestamp DESC 
-      LIMIT 1
-    `).get(serverId);
+  async getLatestMetrics(serverId) {
+    return queryGet(
+      `SELECT * FROM metrics WHERE server_id = ? ORDER BY timestamp DESC LIMIT 1`,
+      [serverId]
+    );
   },
 
-  getMetricsHistory(serverId, limit = 60) {
-    const rows = db.prepare(`
-      SELECT * FROM metrics 
-      WHERE server_id = ? 
-      ORDER BY timestamp DESC 
-      LIMIT ?
-    `).all(serverId, limit);
+  async getMetricsHistory(serverId, limit = 60) {
+    const rows = await queryAll(
+      `SELECT * FROM metrics WHERE server_id = ? ORDER BY timestamp DESC LIMIT ?`,
+      [serverId, limit]
+    );
     return rows.reverse();
   },
 
   // Incidents
-  createIncident(incidentOrServerId, serverName, eventType, details) {
+  async createIncident(incidentOrServerId, serverName, eventType, details) {
     let incident = incidentOrServerId;
     if (typeof incidentOrServerId === 'string') {
       incident = {
@@ -353,49 +418,49 @@ const DB = {
       };
     }
 
-    const stmt = db.prepare(`
-      INSERT INTO incidents (server_id, server_name, event_type, details, started_at, resolved_at, duration_seconds)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      incident.server_id,
-      incident.server_name,
-      incident.event_type,
-      incident.details || '',
-      incident.started_at || Date.now(),
-      incident.resolved_at || null,
-      incident.duration_seconds || null
+    await queryRun(
+      `INSERT INTO incidents (server_id, server_name, event_type, details, started_at, resolved_at, duration_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        incident.server_id,
+        incident.server_name,
+        incident.event_type,
+        incident.details || '',
+        incident.started_at || Date.now(),
+        incident.resolved_at || null,
+        incident.duration_seconds || null
+      ]
     );
   },
 
-  resolveActiveIncident(serverId, eventType) {
-    const active = db.prepare(`
-      SELECT * FROM incidents 
-      WHERE server_id = ? AND event_type = ? AND resolved_at IS NULL 
-      ORDER BY started_at DESC LIMIT 1
-    `).get(serverId, eventType);
+  async resolveActiveIncident(serverId, eventType) {
+    const active = await queryGet(
+      `SELECT * FROM incidents
+       WHERE server_id = ? AND event_type = ? AND resolved_at IS NULL
+       ORDER BY started_at DESC LIMIT 1`,
+      [serverId, eventType]
+    );
 
     if (active) {
       const now = Date.now();
       const duration = Math.round((now - active.started_at) / 1000);
-      db.prepare(`
-        UPDATE incidents 
-        SET resolved_at = ?, duration_seconds = ? 
-        WHERE id = ?
-      `).run(now, duration, active.id);
+      await queryRun(
+        `UPDATE incidents SET resolved_at = ?, duration_seconds = ? WHERE id = ?`,
+        [now, duration, active.id]
+      );
     }
   },
 
-  resolveIncident(serverId, eventType) {
-    this.resolveActiveIncident(serverId, eventType);
+  async resolveIncident(serverId, eventType) {
+    await this.resolveActiveIncident(serverId, eventType);
   },
 
-  getIncidents(limit = 50) {
-    return db.prepare('SELECT * FROM incidents ORDER BY started_at DESC LIMIT ?').all(limit);
+  async getIncidents(limit = 50) {
+    return queryAll('SELECT * FROM incidents ORDER BY started_at DESC LIMIT ?', [limit]);
   },
 
-  getSettings() {
-    const rows = db.prepare('SELECT key, value FROM settings').all();
+  async getSettings() {
+    const rows = await queryAll('SELECT key, value FROM settings');
     const config = {};
     for (const r of rows) {
       config[r.key] = r.value;
@@ -403,18 +468,21 @@ const DB = {
     return config;
   },
 
-  setSetting(key, value) {
-    db.prepare(`
-      INSERT INTO settings (key, value) VALUES (?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(key, String(value));
+  async setSetting(key, value) {
+    await queryRun(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [key, String(value)]
+    );
   },
 
   // ----------------------------------------------------
   // CLOSED-LOOP DDOS & ATTACKER INTELLIGENCE METHODS
   // ----------------------------------------------------
-  saveDdosIncident(data) {
+  async saveDdosIncident(data) {
     const incident_id = data.incident_id || ('INC-' + Date.now());
+    const server_id = data.server_id || 'local-host';
+    const server_ip = data.server_ip || '127.0.0.1';
     const attack_type = data.attack_type || 'Unknown DDoS Attack';
     const mitigation_level = parseInt(data.mitigation_level) || 1;
     const confidence_score = parseFloat(data.confidence_score) || 95.0;
@@ -423,73 +491,175 @@ const DB = {
     const health_probe = typeof data.health_probe === 'object' ? JSON.stringify(data.health_probe) : (data.health_probe || '');
     const created_at = data.created_at || Date.now();
 
-    // Simpan ke ddos_incidents
-    const stmt = db.prepare(`
-      INSERT INTO ddos_incidents (incident_id, attack_type, mitigation_level, confidence_score, status, ai_summary, health_probe, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(incident_id) DO UPDATE SET
-        status = excluded.status,
-        mitigation_level = excluded.mitigation_level,
-        ai_summary = excluded.ai_summary,
-        health_probe = excluded.health_probe
-    `);
-    stmt.run(incident_id, attack_type, mitigation_level, confidence_score, status, ai_summary, health_probe, created_at);
+    const batchStmts = [
+      {
+        sql: `INSERT INTO ddos_incidents (incident_id, server_id, server_ip, attack_type, mitigation_level, confidence_score, status, ai_summary, health_probe, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(incident_id) DO UPDATE SET
+                server_id = excluded.server_id,
+                server_ip = excluded.server_ip,
+                status = excluded.status,
+                mitigation_level = excluded.mitigation_level,
+                ai_summary = excluded.ai_summary,
+                health_probe = excluded.health_probe`,
+        args: [incident_id, server_id, server_ip, attack_type, mitigation_level, confidence_score, status, ai_summary, health_probe, created_at]
+      },
+      {
+        sql: 'DELETE FROM attacker_profiles WHERE incident_id = ?',
+        args: [incident_id]
+      }
+    ];
 
-    // Bersihkan profil penyerang lama jika incident_id sama (idempotent)
-    db.prepare('DELETE FROM attacker_profiles WHERE incident_id = ?').run(incident_id);
-
-    // Simpan daftar profil penyerang (attacker_profiles)
     const attackers = Array.isArray(data.attackers) ? data.attackers : [];
-    const insertAttacker = db.prepare(`
-      INSERT INTO attacker_profiles (
-        incident_id, ip_address, country, country_code, isp, 
-        request_count, attack_vector, user_agent, device_os, device_type,
-        target_port, asn_number, asn_org, day_name, attack_date, attack_time, attack_hour,
-        action_taken, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    let validAttackersCount = 0;
 
     for (const a of attackers) {
       if (!a.ip && !a.ip_address) continue;
+      validAttackersCount++;
       const ip = a.ip || a.ip_address;
       const timeInfo = getIndonesianDateTime(a.created_at || created_at);
 
-      insertAttacker.run(
-        incident_id,
-        ip,
-        a.country || 'Unknown',
-        a.country_code || 'XX',
-        a.isp || 'Unknown ISP',
-        parseInt(a.request_count) || 1,
-        a.attack_vector || attack_type,
-        a.user_agent || 'Mozilla/5.0 Generic Attack Vector',
-        a.device_os || 'Windows 11',
-        a.device_type || 'desktop',
-        parseInt(a.target_port) || 80,
-        a.asn_number || 'AS-UNKNOWN',
-        a.asn_org || a.isp || 'Unknown Provider',
-        a.day_name || timeInfo.day_name,
-        a.attack_date || timeInfo.attack_date,
-        a.attack_time || timeInfo.attack_time,
-        a.attack_hour !== undefined ? parseInt(a.attack_hour) : timeInfo.attack_hour,
-        a.action_taken || 'BLOCKED_IPSET',
-        a.created_at || created_at
-      );
+      batchStmts.push({
+        sql: `INSERT INTO attacker_profiles (
+                incident_id, server_id, ip_address, country, country_code, isp,
+                request_count, attack_vector, user_agent, device_os, device_type,
+                target_port, asn_number, asn_org, day_name, attack_date, attack_time, attack_hour,
+                action_taken, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          incident_id,
+          a.server_id || server_id,
+          ip,
+          a.country || 'Unknown',
+          a.country_code || 'XX',
+          a.isp || 'Unknown ISP',
+          parseInt(a.request_count) || 1,
+          a.attack_vector || attack_type,
+          a.user_agent || 'Mozilla/5.0 Generic Attack Vector',
+          a.device_os || 'Windows 11',
+          a.device_type || 'desktop',
+          parseInt(a.target_port) || 80,
+          a.asn_number || 'AS-UNKNOWN',
+          a.asn_org || a.isp || 'Unknown Provider',
+          a.day_name || timeInfo.day_name,
+          a.attack_date || timeInfo.attack_date,
+          a.attack_time || timeInfo.attack_time,
+          a.attack_hour !== undefined ? parseInt(a.attack_hour) : timeInfo.attack_hour,
+          a.action_taken || 'BLOCKED_IPSET',
+          a.created_at || created_at
+        ]
+      });
     }
+
+    await client.batch(batchStmts, 'write');
 
     return {
       incident_id,
+      server_id,
+      server_ip,
       attack_type,
       mitigation_level,
       status,
-      attackers_count: attackers.length
+      attackers_count: validAttackersCount
     };
   },
 
-  getDdosIncidents(limit = 20) {
-    const incidents = db.prepare('SELECT * FROM ddos_incidents ORDER BY created_at DESC LIMIT ?').all(limit);
-    return incidents.map(inc => {
-      const attackers = db.prepare('SELECT * FROM attacker_profiles WHERE incident_id = ?').all(inc.incident_id);
+  async ingestLiveAttacker(data) {
+    const ip = data.ip_address || data.ip || '127.0.0.1';
+    const server_id = data.server_id || 'node-nginx-wsl';
+    const incident_id = data.incident_id || ('LIVE-' + new Date().toISOString().slice(0, 10).replace(/-/g, ''));
+    const timeInfo = getIndonesianDateTime(Date.now());
+
+    const existing = await queryGet(
+      `SELECT id, request_count FROM attacker_profiles
+       WHERE ip_address = ? AND (incident_id = ? OR created_at > ?)
+       ORDER BY created_at DESC LIMIT 1`,
+      [ip, incident_id, Date.now() - 3600000]
+    );
+
+    if (existing) {
+      await queryRun(
+        `UPDATE attacker_profiles
+         SET request_count = request_count + ?,
+             action_taken = ?,
+             device_os = COALESCE(?, device_os),
+             user_agent = COALESCE(?, user_agent),
+             isp = COALESCE(?, isp)
+         WHERE id = ?`,
+        [
+          parseInt(data.request_count) || 20,
+          data.action_taken || 'BLOCKED (IPTables / Nginx Limiter)',
+          data.device_os || null,
+          data.user_agent || null,
+          data.isp || null,
+          existing.id
+        ]
+      );
+      return existing.id;
+    }
+
+    const info = await queryRun(
+      `INSERT INTO attacker_profiles (
+         incident_id, server_id, ip_address, country, country_code, isp,
+         request_count, attack_vector, user_agent, device_os, device_type,
+         target_port, asn_number, asn_org, day_name, attack_date, attack_time, attack_hour,
+         action_taken, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        incident_id,
+        server_id,
+        ip,
+        data.country || 'Indonesia',
+        data.country_code || 'ID',
+        data.isp || 'Telkomsel / Indosat / XL Cellular',
+        parseInt(data.request_count) || 100,
+        data.attack_vector || 'Distributed DDoS Flood',
+        data.user_agent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        data.device_os || 'Windows 11',
+        data.device_type || 'desktop',
+        parseInt(data.target_port) || 80,
+        data.asn_number || 'AS17974',
+        data.asn_org || 'Cellular Mobile Carrier Indonesia',
+        timeInfo.day_name,
+        timeInfo.attack_date,
+        timeInfo.attack_time,
+        timeInfo.attack_hour,
+        data.action_taken || 'BLOCKED (IPTables / Nginx Limiter)',
+        Date.now()
+      ]
+    );
+    return Number(info.lastInsertRowid);
+  },
+
+  async getDdosIncidents(limit = 20, serverId = null) {
+    let sql = 'SELECT * FROM ddos_incidents';
+    const params = [];
+    if (serverId && serverId !== 'all') {
+      sql += ' WHERE server_id = ?';
+      params.push(serverId);
+    }
+    sql += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(limit);
+
+    const incidents = await queryAll(sql, params);
+    if (incidents.length === 0) return [];
+
+    const incIds = incidents.map((inc) => inc.incident_id);
+    const placeholders = incIds.map(() => '?').join(', ');
+    const allAttackers = await queryAll(
+      `SELECT * FROM attacker_profiles WHERE incident_id IN (${placeholders})`,
+      incIds
+    );
+
+    const attackersByInc = new Map();
+    for (const a of allAttackers) {
+      if (!attackersByInc.has(a.incident_id)) {
+        attackersByInc.set(a.incident_id, []);
+      }
+      attackersByInc.get(a.incident_id).push(a);
+    }
+
+    return incidents.map((inc) => {
       let probe = null;
       try {
         if (inc.health_probe) probe = JSON.parse(inc.health_probe);
@@ -497,22 +667,26 @@ const DB = {
       return {
         ...inc,
         health_probe: probe,
-        attackers
+        attackers: attackersByInc.get(inc.incident_id) || []
       };
     });
   },
 
-  getAttackerProfiles(limit = 100) {
-    return db.prepare(`
-      SELECT * FROM attacker_profiles 
-      ORDER BY created_at DESC 
-      LIMIT ?
-    `).all(limit);
+  async getAttackerProfiles(limit = 100) {
+    return queryAll(
+      `SELECT * FROM attacker_profiles ORDER BY created_at DESC LIMIT ?`,
+      [limit]
+    );
   },
 
-  getFilteredAttackers(options = {}) {
+  async getFilteredAttackers(options = {}) {
     let sql = 'SELECT * FROM attacker_profiles WHERE 1=1';
     const params = [];
+
+    if (options.server_id && options.server_id !== 'all') {
+      sql += ' AND server_id = ?';
+      params.push(options.server_id);
+    }
 
     if (options.os && options.os !== 'all') {
       sql += ' AND device_os LIKE ?';
@@ -533,11 +707,12 @@ const DB = {
     sql += ' ORDER BY created_at DESC LIMIT ?';
     params.push(options.limit || 100);
 
-    return db.prepare(sql).all(...params);
+    return queryAll(sql, params);
   },
 
-  getDeviceStats() {
-    const total = db.prepare('SELECT COUNT(*) as count FROM attacker_profiles').get().count;
+  async getDeviceStats() {
+    const countRow = await queryGet('SELECT COUNT(*) as count FROM attacker_profiles');
+    const total = Number(countRow?.count || 0);
     if (total === 0) {
       return {
         total: 0,
@@ -551,9 +726,9 @@ const DB = {
       };
     }
 
-    const rows = db.prepare(`
-      SELECT 
-        CASE 
+    const rows = await queryAll(`
+      SELECT
+        CASE
           WHEN device_os LIKE '%Windows%' THEN 'Windows'
           WHEN device_os LIKE '%Linux%' OR device_os LIKE '%Ubuntu%' OR device_os LIKE '%Debian%' THEN 'Linux'
           WHEN device_os LIKE '%macOS%' OR device_os LIKE '%Mac%' THEN 'macOS'
@@ -564,26 +739,25 @@ const DB = {
       FROM attacker_profiles
       GROUP BY os_category
       ORDER BY count DESC
-    `).all();
+    `);
 
-    const distribution = rows.map(r => ({
+    const distribution = rows.map((r) => ({
       os: r.os_category,
-      count: r.count,
-      percentage: Math.round((r.count / total) * 1000) / 10
+      count: Number(r.count),
+      percentage: Math.round((Number(r.count) / total) * 1000) / 10
     }));
 
     return { total, distribution };
   },
 
-  getHourlyDistribution() {
-    const rows = db.prepare(`
+  async getHourlyDistribution() {
+    const rows = await queryAll(`
       SELECT attack_hour, COUNT(*) as hit_count
       FROM attacker_profiles
       GROUP BY attack_hour
       ORDER BY attack_hour ASC
-    `).all();
+    `);
 
-    // Map 0 - 23 hours
     const hours = Array.from({ length: 24 }, (_, i) => ({
       hour: `${String(i).padStart(2, '0')}:00`,
       hour_num: i,
@@ -591,71 +765,64 @@ const DB = {
     }));
 
     for (const r of rows) {
-      const idx = r.attack_hour;
+      const idx = Number(r.attack_hour);
       if (hours[idx]) {
-        hours[idx].hits = r.hit_count;
+        hours[idx].hits = Number(r.hit_count);
       }
     }
 
     return hours;
   },
 
-  getAllAttackersForExport() {
-    return db.prepare(`
-      SELECT 
-        id,
-        incident_id,
-        ip_address,
-        country,
-        country_code,
-        isp,
-        asn_number,
-        asn_org,
-        target_port,
-        device_os,
-        device_type,
-        attack_vector,
-        request_count,
-        day_name,
-        attack_date,
-        attack_time,
-        action_taken,
-        user_agent
-      FROM attacker_profiles 
+  async getAllAttackersForExport() {
+    return queryAll(`
+      SELECT
+        id, incident_id, ip_address, country, country_code, isp,
+        asn_number, asn_org, target_port, device_os, device_type,
+        attack_vector, request_count, day_name, attack_date, attack_time,
+        action_taken, user_agent
+      FROM attacker_profiles
       ORDER BY created_at DESC
-    `).all();
+    `);
   },
 
-  getDdosSummaryStats() {
-    const totalIncidents = db.prepare('SELECT COUNT(*) as count FROM ddos_incidents').get().count;
-    const totalAttackersBlocked = db.prepare('SELECT COUNT(DISTINCT ip_address) as count FROM attacker_profiles').get().count;
-    const latestIncident = db.prepare('SELECT * FROM ddos_incidents ORDER BY created_at DESC LIMIT 1').get();
-    
-    // Top 5 Countries of attackers
-    const topCountries = db.prepare(`
-      SELECT country, country_code, COUNT(*) as hit_count 
-      FROM attacker_profiles 
-      GROUP BY country 
-      ORDER BY hit_count DESC 
-      LIMIT 5
-    `).all();
+  async getDdosSummaryStats() {
+    const [
+      incCountRow,
+      attCountRow,
+      latestIncident,
+      topCountries,
+      topIps,
+      settings
+    ] = await Promise.all([
+      queryGet('SELECT COUNT(*) as count FROM ddos_incidents'),
+      queryGet('SELECT COUNT(DISTINCT ip_address) as count FROM attacker_profiles'),
+      queryGet('SELECT * FROM ddos_incidents ORDER BY created_at DESC LIMIT 1'),
+      queryAll(`
+        SELECT country, country_code, COUNT(*) as hit_count
+        FROM attacker_profiles
+        GROUP BY country
+        ORDER BY hit_count DESC
+        LIMIT 5
+      `),
+      queryAll(`
+        SELECT ip_address, country, country_code, isp, device_os, target_port, SUM(request_count) as total_requests, action_taken
+        FROM attacker_profiles
+        GROUP BY ip_address
+        ORDER BY total_requests DESC
+        LIMIT 10
+      `),
+      this.getSettings()
+    ]);
 
-    // Top 5 Attacker IPs by requests
-    const topIps = db.prepare(`
-      SELECT ip_address, country, country_code, isp, device_os, target_port, SUM(request_count) as total_requests, action_taken
-      FROM attacker_profiles
-      GROUP BY ip_address
-      ORDER BY total_requests DESC
-      LIMIT 10
-    `).all();
-
-    // Mode Closed Loop
-    const mode = this.getSettings().closed_loop_mode || 'auto';
+    const totalIncidents = Number(incCountRow?.count || 0);
+    const totalAttackersBlocked = Number(attCountRow?.count || 0);
+    const mode = settings.closed_loop_mode || 'auto';
 
     return {
       total_incidents: totalIncidents,
       total_attackers_blocked: totalAttackersBlocked,
-      current_defense_level: latestIncident ? latestIncident.mitigation_level : 0,
+      current_defense_level: latestIncident ? Number(latestIncident.mitigation_level) : 0,
       current_status: latestIncident ? latestIncident.status : 'NORMAL',
       closed_loop_mode: mode,
       latest_incident: latestIncident || null,
@@ -667,9 +834,9 @@ const DB = {
   // ----------------------------------------------------
   // ADMIN AUTHENTICATION & SESSION METHODS
   // ----------------------------------------------------
-  authenticateAdmin(username, password) {
+  async authenticateAdmin(username, password) {
     if (!username || !password) return null;
-    const user = db.prepare('SELECT * FROM admin_users WHERE username = ?').get(username);
+    const user = await queryGet('SELECT * FROM admin_users WHERE username = ?', [username]);
     if (!user) return null;
 
     const isValid = verifyPassword(password, user.salt, user.password_hash);
@@ -684,21 +851,25 @@ const DB = {
     };
   },
 
-  createAdminSession(username) {
+  async createAdminSession(username) {
     const token = crypto.randomBytes(32).toString('hex');
     const now = Date.now();
     const expiresAt = now + (24 * 3600 * 1000); // 24 Hours
 
-    db.prepare(`
-      INSERT INTO admin_sessions (token, username, created_at, expires_at)
-      VALUES (?, ?, ?, ?)
-    `).run(token, username, now, expiresAt);
-
-    // Update last_login on admin_users
-    db.prepare('UPDATE admin_users SET last_login = ? WHERE username = ?').run(now, username);
-
-    // Clean expired sessions
-    db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(now);
+    await client.batch([
+      {
+        sql: `INSERT INTO admin_sessions (token, username, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+        args: [token, username, now, expiresAt]
+      },
+      {
+        sql: 'UPDATE admin_users SET last_login = ? WHERE username = ?',
+        args: [now, username]
+      },
+      {
+        sql: 'DELETE FROM admin_sessions WHERE expires_at < ?',
+        args: [now]
+      }
+    ], 'write');
 
     return {
       token,
@@ -706,27 +877,26 @@ const DB = {
     };
   },
 
-  verifyAdminSession(token) {
+  async verifyAdminSession(token) {
     if (!token) return null;
     const now = Date.now();
 
-    const session = db.prepare(`
-      SELECT s.token, s.username, s.expires_at, u.full_name, u.role
-      FROM admin_sessions s
-      JOIN admin_users u ON s.username = u.username
-      WHERE s.token = ? AND s.expires_at > ?
-    `).get(token, now);
-
-    return session || null;
+    return queryGet(
+      `SELECT s.token, s.username, s.expires_at, u.full_name, u.role
+       FROM admin_sessions s
+       JOIN admin_users u ON s.username = u.username
+       WHERE s.token = ? AND s.expires_at > ?`,
+      [token, now]
+    );
   },
 
-  deleteAdminSession(token) {
+  async deleteAdminSession(token) {
     if (!token) return;
-    db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
+    await queryRun('DELETE FROM admin_sessions WHERE token = ?', [token]);
   },
 
-  changeAdminPassword(username, oldPassword, newPassword) {
-    const user = db.prepare('SELECT * FROM admin_users WHERE username = ?').get(username);
+  async changeAdminPassword(username, oldPassword, newPassword) {
+    const user = await queryGet('SELECT * FROM admin_users WHERE username = ?', [username]);
     if (!user) return { success: false, error: 'User tidak ditemukan' };
 
     const isValid = verifyPassword(oldPassword, user.salt, user.password_hash);
@@ -735,11 +905,10 @@ const DB = {
     const newSalt = crypto.randomBytes(16).toString('hex');
     const newHash = hashPassword(newPassword, newSalt);
 
-    db.prepare(`
-      UPDATE admin_users 
-      SET password_hash = ?, salt = ? 
-      WHERE username = ?
-    `).run(newHash, newSalt, username);
+    await queryRun(
+      `UPDATE admin_users SET password_hash = ?, salt = ? WHERE username = ?`,
+      [newHash, newSalt, username]
+    );
 
     return { success: true };
   }

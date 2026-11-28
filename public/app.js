@@ -6,6 +6,8 @@ let state = {
   activeTab: 'overview',
   selectedTimeRange: -900, // default 15 minutes, matching the user's reference link
   selectedOsFilter: 'all',
+  selectedNodeId: 'all',
+  serversList: [],
   searchQuery: '',
   closedLoopMode: 'auto',
   adminToken: localStorage.getItem('serverpulse_admin_token') || null,
@@ -20,13 +22,20 @@ let state = {
   }
 };
 
+const APP_CONFIG = window.SERVERPULSE_CONFIG || {};
+
+function apiUrl(endpoint) {
+  const base = (APP_CONFIG.API_BASE || '').replace(/\/+$/, '');
+  return `${base}${endpoint}`;
+}
+
 // Authenticated Fetch Helper
 function authFetch(url, options = {}) {
   const headers = options.headers || {};
   if (state.adminToken) {
     headers['Authorization'] = `Bearer ${state.adminToken}`;
   }
-  return fetch(url, { ...options, headers });
+  return fetch(apiUrl(url), { ...options, headers });
 }
 
 // -------------------------------------------------------------------
@@ -38,6 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (fileWarn) fileWarn.classList.remove('hidden');
   }
   checkAdminAuth();
+  initTailscaleStatus();
 });
 
 async function checkAdminAuth() {
@@ -83,6 +93,7 @@ function revealDashboard(user) {
     initThemeCharts();
 
     // Initial Data Loads
+    populateGlobalNodeSelector();
     syncNetdataNow();
     loadNetdataHistory(state.selectedTimeRange);
     fetchDdosIntel();
@@ -118,7 +129,7 @@ async function handleAdminLogin(event) {
   errorAlert.classList.add('hidden');
 
   try {
-    const res = await fetch('/api/auth/login', {
+    const res = await fetch(apiUrl('/api/auth/login'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password })
@@ -152,6 +163,8 @@ async function handleAdminLogin(event) {
   } catch (err) {
     if (window.location.protocol === 'file:') {
       errorText.textContent = 'Aplikasi dibuka via file://! Harap buka di browser: http://localhost:3000';
+    } else if (window.location.hostname.endsWith('.netlify.app')) {
+      errorText.textContent = 'Gagal menghubungi server API backend. Pastikan URL backend di netlify.toml sudah diarahkan dan service backend aktif.';
     } else {
       errorText.textContent = 'Gagal menghubungi server. Pastikan backend aktif (jalankan start-server.bat) di http://localhost:3000.';
     }
@@ -214,8 +227,17 @@ async function handleChangePassword(event) {
 // WEBSOCKET REAL-TIME STREAMING
 // -------------------------------------------------------------------
 function initWebSocket() {
+  const configuredWs = (APP_CONFIG.WS_URL || '').trim();
+  const isHostedStatic = window.location.hostname.endsWith('.netlify.app');
+
+  // Netlify proxy does not forward persistent WebSockets unless WS_URL is configured
+  if (isHostedStatic && !configuredWs) {
+    updateWsStatus(false, 'Live Polling (3s)');
+    return;
+  }
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/ws`;
+  const wsUrl = configuredWs || `${protocol}//${window.location.host}/ws`;
 
   state.socket = new WebSocket(wsUrl);
 
@@ -242,12 +264,15 @@ function initWebSocket() {
   };
 }
 
-function updateWsStatus(isConnected) {
+function updateWsStatus(isConnected, customLabel = null) {
   const badge = document.getElementById('ws-badge');
   const text = document.getElementById('ws-status-text');
   if (isConnected) {
     badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-950/60 border border-emerald-800/60 text-emerald-400 text-xs font-mono font-medium';
-    text.textContent = 'Live Connected';
+    text.textContent = customLabel || 'Live Connected';
+  } else if (customLabel) {
+    badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl bg-cyan-950/60 border border-cyan-800/60 text-cyan-400 text-xs font-mono font-medium';
+    text.textContent = customLabel;
   } else {
     badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl bg-rose-950/60 border border-rose-800/60 text-rose-400 text-xs font-mono font-medium';
     text.textContent = 'Reconnecting...';
@@ -319,14 +344,50 @@ function switchTab(tabId) {
 }
 
 // -------------------------------------------------------------------
-// NETDATA OBSERVABILITY (zaa-virtualbox @ 192.168.56.104:19999)
+// MULTI-NODE FLEET SELECTOR & NETDATA OBSERVABILITY
 // -------------------------------------------------------------------
+async function populateGlobalNodeSelector() {
+  try {
+    const res = await fetch(apiUrl('/api/servers'));
+    const servers = await res.json();
+    state.serversList = servers;
+    const selector = document.getElementById('global-node-selector');
+    if (!selector) return;
+
+    selector.innerHTML = '<option value="all">🌐 Semua Node (Fleet Aggregator)</option>';
+    servers.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      const statusIcon = s.status === 'online' ? '🟢' : s.status === 'degraded' ? '🟡' : '🔴';
+      opt.textContent = `${statusIcon} ${s.name} (${s.target || s.type})`;
+      selector.appendChild(opt);
+    });
+
+    if (state.selectedNodeId) {
+      selector.value = state.selectedNodeId;
+    }
+  } catch (err) {
+    console.error('Failed to populate node selector:', err);
+  }
+}
+
+function onGlobalNodeChange(nodeId) {
+  state.selectedNodeId = nodeId;
+  console.log('[Fleet] Target Node beralih ke:', nodeId);
+  syncNetdataNow();
+  loadNetdataHistory(state.selectedTimeRange);
+  fetchDdosIntel();
+  refreshAnsibleLogs();
+  showToast('Node Berpindah', `Memantau telemetri target: ${nodeId === 'all' ? 'Seluruh Armada' : nodeId}`, 'info');
+}
+
 async function syncNetdataNow() {
   const icon = document.getElementById('icon-sync');
-  icon.classList.add('fa-spin');
+  if (icon) icon.classList.add('fa-spin');
 
   try {
-    const res = await fetch('/api/netdata/live');
+    const nodeParam = state.selectedNodeId && state.selectedNodeId !== 'all' ? `?server_id=${state.selectedNodeId}` : '';
+    const res = await fetch(apiUrl(`/api/netdata/live${nodeParam}`));
     const data = await res.json();
     if (data.success) {
       renderNetdataHostInfo(data.host_info);
@@ -335,14 +396,15 @@ async function syncNetdataNow() {
   } catch (err) {
     console.error('Error syncing Netdata:', err);
   } finally {
-    setTimeout(() => icon.classList.remove('fa-spin'), 600);
+    if (icon) setTimeout(() => icon.classList.remove('fa-spin'), 600);
   }
 }
 
 async function fetchNetdataLiveMetrics() {
   if (state.activeTab !== 'overview' || !state.adminToken) return;
   try {
-    const res = await fetch('/api/netdata/live');
+    const nodeParam = state.selectedNodeId && state.selectedNodeId !== 'all' ? `?server_id=${state.selectedNodeId}` : '';
+    const res = await fetch(apiUrl(`/api/netdata/live${nodeParam}`));
     const data = await res.json();
     if (data.success) {
       renderNetdataLiveTelemetry(data.telemetry);
@@ -354,11 +416,18 @@ async function fetchNetdataLiveMetrics() {
 
 function renderNetdataHostInfo(info) {
   if (!info) return;
-  document.getElementById('header-target-host').textContent = `${info.hostname} (192.168.56.104)`;
-  document.getElementById('nd-hostname').textContent = info.hostname;
+  const headerHost = document.getElementById('header-target-host');
+  if (headerHost) headerHost.textContent = `${info.hostname}`;
+  const ndHost = document.getElementById('nd-hostname');
+  if (ndHost) ndHost.textContent = info.hostname;
+  const ndTargetUrl = document.getElementById('nd-target-url');
+  if (ndTargetUrl) {
+    const activeServer = state.serversList.find(s => s.id === state.selectedNodeId);
+    ndTargetUrl.textContent = activeServer ? (activeServer.netdata_url || activeServer.target) : 'http://192.168.56.104:19999';
+  }
   document.getElementById('nd-os-name').textContent = `${info.os_name} ${info.os_version}`;
   document.getElementById('nd-kernel-info').textContent = info.kernel || 'Kernel 6.8.0 x86_64';
-  document.getElementById('nd-cores-info').textContent = `${info.cores_total} Core (Linux VirtualBox)`;
+  document.getElementById('nd-cores-info').textContent = `${info.cores_total} Core (${info.hostname})`;
   document.getElementById('nd-ram-total').textContent = `${info.ram_total_gb} GB RAM Total`;
   document.getElementById('nd-version-tag').textContent = `${info.version} (1-sec sampling)`;
 }
@@ -441,9 +510,10 @@ function switchTimeRange(seconds) {
 
 async function loadNetdataHistory(afterSeconds) {
   try {
+    const nodeParam = state.selectedNodeId && state.selectedNodeId !== 'all' ? `&server_id=${state.selectedNodeId}` : '';
     const [cpuRes, netRes] = await Promise.all([
-      fetch(`/api/netdata/history?chart=system.cpu&after=${afterSeconds}&points=40`),
-      fetch(`/api/netdata/history?chart=system.net&after=${afterSeconds}&points=40`)
+      fetch(apiUrl(`/api/netdata/history?chart=system.cpu&after=${afterSeconds}&points=40${nodeParam}`)),
+      fetch(apiUrl(`/api/netdata/history?chart=system.net&after=${afterSeconds}&points=40${nodeParam}`))
     ]);
 
     const cpuData = await cpuRes.json();
@@ -504,9 +574,9 @@ function updateModeUI(mode) {
 async function fetchDdosIntel() {
   try {
     const [statsRes, deviceRes, hourlyRes] = await Promise.all([
-      fetch('/api/ddos/stats'),
-      fetch('/api/ddos/device-stats'),
-      fetch('/api/ddos/hourly-stats')
+      fetch(apiUrl('/api/ddos/stats')),
+      fetch(apiUrl('/api/ddos/device-stats')),
+      fetch(apiUrl('/api/ddos/hourly-stats'))
     ]);
 
     const stats = await statsRes.json();
@@ -571,11 +641,12 @@ function renderDdosKpiStats(stats, deviceStats) {
 async function fetchAttackersTable() {
   try {
     const params = new URLSearchParams();
+    if (state.selectedNodeId && state.selectedNodeId !== 'all') params.append('server_id', state.selectedNodeId);
     if (state.selectedOsFilter !== 'all') params.append('os', state.selectedOsFilter);
     if (state.searchQuery.trim().length > 0) params.append('search', state.searchQuery.trim());
     params.append('limit', 100);
 
-    const res = await fetch(`/api/ddos/attackers?${params.toString()}`);
+    const res = await fetch(apiUrl(`/api/ddos/attackers?${params.toString()}`));
     const attackers = await res.json();
     renderAttackersTable(attackers);
   } catch (err) {
@@ -714,7 +785,7 @@ function handleAttackerSearch(event) {
 // -------------------------------------------------------------------
 function exportForensicLogs(format = 'csv') {
   showToast('Mengunduh Laporan', `Menyiapkan berkas forensik .${format.toUpperCase()}...`, 'info');
-  const url = `/api/ddos/export?format=${format}`;
+  const url = apiUrl(`/api/ddos/export?format=${format}`);
   
   const a = document.createElement('a');
   a.href = url;
@@ -746,10 +817,15 @@ async function simulateDdosAttack() {
 
 async function resetDdosDefense() {
   try {
-    const res = await authFetch('/api/ddos/recovery', { method: 'POST' });
+    const targetServer = state.selectedNodeId || 'local-host';
+    const res = await authFetch('/api/ddos/recovery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ server_id: targetServer })
+    });
     const data = await res.json();
     if (res.ok && data.success) {
-      showToast('Pertahanan Dinormalkan', 'Seluruh rule sementara dibersihkan. Status kembali ke Level 0.', 'success');
+      showToast('Pertahanan Dinormalkan', `Seluruh rule sementara dibersihkan pada [${targetServer}]. Status kembali ke Level 0.`, 'success');
       fetchDdosIntel();
       refreshAnsibleLogs();
     } else {
@@ -765,15 +841,16 @@ async function resetDdosDefense() {
 // -------------------------------------------------------------------
 async function triggerManualMitigation(level) {
   try {
-    showToast('Mengeksekusi Playbook', `Menjalankan remedi mitigasi Level ${level} via Ansible...`, 'info');
+    const targetServer = state.selectedNodeId || 'local-host';
+    showToast('Mengeksekusi Playbook', `Menjalankan remedi mitigasi Level ${level} via Ansible pada node [${targetServer}]...`, 'info');
     const res = await authFetch('/api/ddos/mitigate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ level })
+      body: JSON.stringify({ level, server_id: targetServer })
     });
     const data = await res.json();
     if (res.ok && data.success) {
-      showToast('Mitigasi Berhasil!', `Level ${level} aktif. Playbook ${data.mitigation.playbook} selesai.`, 'success');
+      showToast('Mitigasi Berhasil!', `Level ${level} aktif pada node [${targetServer}]. Playbook ${data.mitigation.playbook} selesai.`, 'success');
       fetchDdosIntel();
       refreshAnsibleLogs();
     } else {
@@ -790,7 +867,7 @@ async function triggerRecoveryLoop() {
 
 async function refreshAnsibleLogs() {
   try {
-    const res = await fetch('/api/ddos/logs');
+    const res = await fetch(apiUrl('/api/ddos/logs'));
     const logs = await res.json();
     const container = document.getElementById('ansible-terminal-log');
 
@@ -823,7 +900,7 @@ async function refreshAnsibleLogs() {
 // -------------------------------------------------------------------
 async function fetchIncidentsHistory() {
   try {
-    const res = await fetch('/api/ddos/incidents?limit=25');
+    const res = await fetch(apiUrl('/api/ddos/incidents?limit=25'));
     const incidents = await res.json();
     const tbody = document.getElementById('incidents-history-table-body');
 
@@ -866,7 +943,7 @@ async function fetchIncidentsHistory() {
 // -------------------------------------------------------------------
 async function fetchSettings() {
   try {
-    const res = await fetch('/api/settings');
+    const res = await fetch(apiUrl('/api/settings'));
     const cfg = await res.json();
     if (cfg.netdata_host) document.getElementById('setting-netdata-host').value = cfg.netdata_host;
     if (cfg.telegram_bot_token) document.getElementById('setting-tg-token').value = cfg.telegram_bot_token;
@@ -906,7 +983,7 @@ async function saveAllSettings() {
 async function testNotificationAlert() {
   try {
     showToast('Mengirim Notifikasi Uji Coba...', 'Menghubungi Telegram & Discord Webhook...', 'info');
-    const res = await fetch('/api/alerts/test', {
+    const res = await fetch(apiUrl('/api/alerts/test'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1200,4 +1277,41 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+// -------------------------------------------------------------------
+// TAILSCALE MESH STATUS & COPY HELPERS
+// -------------------------------------------------------------------
+let currentTailscaleIp = '100.79.15.102';
+
+async function initTailscaleStatus() {
+  try {
+    const res = await fetch(apiUrl('/api/tailscale/status'));
+    if (res.ok) {
+      const data = await res.json();
+      const badge = document.getElementById('tailscale-mesh-badge');
+      const ipDisplay = document.getElementById('tailscale-ip-display');
+      if (data.ip) {
+        currentTailscaleIp = data.ip;
+        if (ipDisplay) ipDisplay.textContent = data.ip;
+        if (badge) badge.classList.remove('hidden');
+      } else if (badge) {
+        badge.classList.add('hidden');
+      }
+    }
+  } catch (e) {
+    // Non-critical mesh status query
+  }
+}
+
+function copyTailscaleIp() {
+  if (navigator.clipboard && currentTailscaleIp) {
+    navigator.clipboard.writeText(currentTailscaleIp).then(() => {
+      showToast('success', 'IP Mesh Disalin!', `Alamat IP ${currentTailscaleIp} siap dikirimkan ke laptop teman.`);
+    }).catch(() => {
+      prompt('Salin IP Target Tailscale:', currentTailscaleIp);
+    });
+  } else {
+    prompt('Salin IP Target Tailscale:', currentTailscaleIp);
+  }
 }

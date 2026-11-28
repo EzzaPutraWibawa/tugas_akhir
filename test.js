@@ -102,7 +102,11 @@ async function runTests() {
     console.log('\n======================================================');
     console.log('🎉 SEMUA PENGUJIAN OTOMATIS BERHASIL (100% PASS)');
     console.log('======================================================');
-    process.exit(0);
+    const TailscaleBridge = require('./services/tailscale_bridge');
+    TailscaleBridge.stopBridge();
+    setTimeout(() => {
+      process.exit(0);
+    }, 100);
 
   } catch (err) {
     console.error('\n❌ PENGUJIAN GAGAL:', err);

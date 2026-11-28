@@ -13,6 +13,8 @@ ansible_self_healing.log
 # Environment & Editor
 .env
 .env.local
+.env.*
+!.env.example
 .vscode/
 Thumbs.db
 desktop.ini

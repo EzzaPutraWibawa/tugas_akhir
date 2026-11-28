@@ -184,6 +184,13 @@ async function runTests() {
     assert.strictEqual(modeData.mode, 'manual');
     console.log(` -> OK (Mode berhasil diubah ke: ${modeData.mode.toUpperCase()})`);
 
+    // Restore back to auto mode for continuous self-healing
+    await fetch(`${baseUrl}/api/ddos/mode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: JSON.stringify({ mode: 'auto' })
+    });
+
     // -------------------------------------------------------------
     // TEST 7: 3-Level Mitigation & Recovery Trigger
     // -------------------------------------------------------------

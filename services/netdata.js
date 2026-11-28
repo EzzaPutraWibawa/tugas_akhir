@@ -7,15 +7,23 @@ class NetdataService {
   constructor() {
     this.defaultHost = 'http://localhost:19999';
     this.timeoutMs = 3500;
+    this.isNetdataReachable = false;
   }
 
-  getHost() {
-    const settings = DB.getSettings();
-    return settings.netdata_host || this.defaultHost;
+  async getHost(serverId = null) {
+    if (serverId && serverId !== 'all') {
+      const srv = await DB.getServerById(serverId);
+      if (srv) {
+        if (srv.netdata_url) return srv.netdata_url.replace(/\/+$/, '');
+        if (srv.target && srv.target.startsWith('http')) return srv.target.replace(/\/+$/, '');
+      }
+    }
+    const settings = await DB.getSettings();
+    return (settings.netdata_host || this.defaultHost).replace(/\/+$/, '');
   }
 
-  async fetchWithTimeout(endpoint, timeout = this.timeoutMs) {
-    const host = this.getHost();
+  async fetchWithTimeout(endpoint, timeout = this.timeoutMs, serverId = null) {
+    const host = await this.getHost(serverId);
     const url = `${host}${endpoint}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -24,7 +32,7 @@ class NetdataService {
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
       if (!res.ok) {
-        throw new Error(`HTTP Error ${res.status} from Netdata`);
+        throw new Error(`HTTP Error ${res.status} from Netdata (${host})`);
       }
       return await res.json();
     } catch (err) {
@@ -34,12 +42,15 @@ class NetdataService {
   }
 
   // Get Host System info (Linux Mint, Cores, RAM, Netdata version)
-  async getHostInfo() {
+  async getHostInfo(serverId = null) {
+    const targetServer = serverId && serverId !== 'all' ? await DB.getServerById(serverId) : null;
+    const defaultHostLabel = targetServer ? targetServer.name : 'zaa-VirtualBox';
+
     try {
-      const data = await this.fetchWithTimeout('/api/v1/info');
+      const data = await this.fetchWithTimeout('/api/v1/info', this.timeoutMs, serverId);
       return {
         online: true,
-        hostname: data.hostname || 'zaa-VirtualBox',
+        hostname: data.hostname || defaultHostLabel,
         os_name: data.os_name || 'Linux Mint',
         os_version: data.os_version || '22.3',
         kernel: data.kernel_version || 'Linux x86_64',
@@ -55,25 +66,25 @@ class NetdataService {
       return {
         online: false,
         error: err.message,
-        hostname: 'zaa-VirtualBox (Offline/Unreachable)',
-        os_name: 'Linux Mint',
-        os_version: '22.3',
-        cores_total: 1,
-        ram_total_gb: 3.7,
-        disk_space_gb: 32.0,
-        version: 'Netdata v2.13'
+        hostname: `${defaultHostLabel} (Offline / Standalone Node)`,
+        os_name: 'Linux / Host Agent',
+        os_version: '22.04 LTS',
+        cores_total: 2,
+        ram_total_gb: 4.0,
+        disk_space_gb: 40.0,
+        version: 'Netdata Telemetry Agent'
       };
     }
   }
 
   // Get live CPU, RAM, Network, and Load metrics
-  async getLiveTelemetry() {
+  async getLiveTelemetry(serverId = null) {
     try {
       const [cpuData, ramData, netData, alarmsData] = await Promise.allSettled([
-        this.fetchWithTimeout('/api/v1/data?chart=system.cpu&after=-5&points=1'),
-        this.fetchWithTimeout('/api/v1/data?chart=system.ram&after=-5&points=1'),
-        this.fetchWithTimeout('/api/v1/data?chart=system.net&after=-5&points=1'),
-        this.fetchWithTimeout('/api/v1/alarms?active')
+        this.fetchWithTimeout('/api/v1/data?chart=system.cpu&after=-5&points=1', this.timeoutMs, serverId),
+        this.fetchWithTimeout('/api/v1/data?chart=system.ram&after=-5&points=1', this.timeoutMs, serverId),
+        this.fetchWithTimeout('/api/v1/data?chart=system.net&after=-5&points=1', this.timeoutMs, serverId),
+        this.fetchWithTimeout('/api/v1/alarms?active', this.timeoutMs, serverId)
       ]);
 
       let cpu = { total: 0, user: 0, system: 0, softirq: 0 };
@@ -158,10 +169,10 @@ class NetdataService {
   }
 
   // Get historical time series for charts (e.g. after=-900 for 15 minutes, points=60)
-  async getChartHistory(chartName = 'system.cpu', afterSeconds = -900, points = 60) {
+  async getChartHistory(chartName = 'system.cpu', afterSeconds = -900, points = 60, serverId = null) {
     try {
       const endpoint = `/api/v1/data?chart=${encodeURIComponent(chartName)}&after=${afterSeconds}&points=${points}`;
-      const data = await this.fetchWithTimeout(endpoint);
+      const data = await this.fetchWithTimeout(endpoint, this.timeoutMs, serverId);
       
       const labels = [];
       const series = {};
@@ -221,6 +232,7 @@ class NetdataService {
   async checkDdosAlarms() {
     try {
       const data = await this.fetchWithTimeout('/api/v1/alarms?active', 2000);
+      this.isNetdataReachable = true;
       const triggered = [];
 
       if (data && data.alarms) {
@@ -278,6 +290,7 @@ class NetdataService {
 
       return triggered;
     } catch (err) {
+      this.isNetdataReachable = false;
       return [];
     }
   }

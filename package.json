@@ -5,7 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:self-healing": "node test-self-healing.js",
+    "db:migrate": "node scripts/migrate_sqlite_to_cloud.js",
+    "db:cleanup": "node scripts/cleanup_dummy_data.js"
   },
   "keywords": [
     "monitoring",
@@ -18,6 +21,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "ws": "^8.18.0"

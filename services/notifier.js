@@ -16,7 +16,7 @@ const Notifier = {
     }
     alertCooldowns.set(key, now);
 
-    const settings = DB.getSettings();
+    const settings = await DB.getSettings();
     const results = { telegram: false, discord: false };
 
     // Format emoji & title based on level & eventType
@@ -41,12 +41,13 @@ const Notifier = {
     // 1. Send to Telegram if configured
     if (settings.telegram_bot_token && settings.telegram_chat_id) {
       try {
+        const dashboardUrl = process.env.PUBLIC_DASHBOARD_URL || 'http://localhost:3000';
         const tgText = `${icon} *${title}*\n\n` +
           `🖥️ *Server*: \`${serverName}\`\n` +
           `📌 *Event*: ${eventType.toUpperCase()}\n` +
           `📝 *Detail*: ${message}\n` +
           `⏰ *Waktu*: ${timestampStr}\n` +
-          `🌐 *Monitoring*: [ServerPulse Dashboard](http://localhost:3000)`;
+          `🌐 *Monitoring*: [ServerPulse Dashboard](${dashboardUrl})`;
 
         const res = await fetch(`https://api.telegram.org/bot${settings.telegram_bot_token}/sendMessage`, {
           method: 'POST',
@@ -106,7 +107,7 @@ const Notifier = {
   },
 
   async testNotification(params = {}) {
-    const settings = DB.getSettings();
+    const settings = await DB.getSettings();
     const token = params.telegram_bot_token || settings.telegram_bot_token;
     const chatId = params.telegram_chat_id || settings.telegram_chat_id;
     const discordUrl = params.discord_webhook_url || settings.discord_webhook_url;

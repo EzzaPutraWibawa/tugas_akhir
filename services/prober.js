@@ -53,22 +53,22 @@ class ProberService {
 
   async runCheckCycle() {
     try {
-      const servers = DB.getServers();
-      const settings = DB.getSettings();
+      const servers = await DB.getServers();
+      const settings = await DB.getSettings();
       const offlineTimeout = (parseInt(settings.offline_timeout_seconds) || 25) * 1000;
       const now = Date.now();
 
       for (const server of servers) {
         if (server.id === 'local-host') {
           // Self-monitor the local computer running ServerPulse
-          this.checkLocalHost(server);
+          await this.checkLocalHost(server);
           continue;
         }
 
         if (server.type === 'probe') {
           await this.checkProbeServer(server);
         } else if (server.type === 'agent') {
-          this.checkAgentServer(server, offlineTimeout, now);
+          await this.checkAgentServer(server, offlineTimeout, now);
         }
       }
     } catch (err) {
@@ -76,7 +76,7 @@ class ProberService {
     }
   }
 
-  checkLocalHost(server) {
+  async checkLocalHost(server) {
     const totalMemBytes = os.totalmem();
     const freeMemBytes = os.freemem();
     const usedMemBytes = totalMemBytes - freeMemBytes;
@@ -98,11 +98,11 @@ class ProberService {
 
     // Update status to online
     if (server.status !== 'online') {
-      DB.updateServerStatus(server.id, 'online', Date.now(), osInfo);
-      DB.resolveIncident(server.id, 'offline');
+      await DB.updateServerStatus(server.id, 'online', Date.now(), osInfo);
+      await DB.resolveIncident(server.id, 'offline');
       this.broadcast({ type: 'server_status', serverId: server.id, status: 'online' });
     } else {
-      DB.updateServerStatus(server.id, 'online', Date.now(), osInfo);
+      await DB.updateServerStatus(server.id, 'online', Date.now(), osInfo);
     }
 
     // Save metrics
@@ -124,7 +124,7 @@ class ProberService {
       ]
     };
 
-    DB.saveMetrics(metricsPayload);
+    await DB.saveMetrics(metricsPayload);
     this.broadcast({ type: 'metrics_update', serverId: server.id, metrics: metricsPayload });
   }
 
@@ -171,11 +171,11 @@ class ProberService {
     const oldStatus = server.status;
 
     if (newStatus !== oldStatus) {
-      DB.updateServerStatus(server.id, newStatus, Date.now());
+      await DB.updateServerStatus(server.id, newStatus, Date.now());
       this.broadcast({ type: 'server_status', serverId: server.id, status: newStatus });
 
       if (newStatus === 'offline') {
-        DB.createIncident(server.id, server.name, 'offline', details);
+        await DB.createIncident(server.id, server.name, 'offline', details);
         Notifier.sendAlert({
           serverId: server.id,
           serverName: server.name,
@@ -184,7 +184,7 @@ class ProberService {
           level: 'danger'
         });
       } else if (newStatus === 'online' && oldStatus === 'offline') {
-        DB.resolveIncident(server.id, 'offline');
+        await DB.resolveIncident(server.id, 'offline');
         Notifier.sendAlert({
           serverId: server.id,
           serverName: server.name,
@@ -194,7 +194,7 @@ class ProberService {
         });
       }
     } else {
-      DB.updateServerStatus(server.id, newStatus, Date.now());
+      await DB.updateServerStatus(server.id, newStatus, Date.now());
     }
 
     // Save latency metrics
@@ -211,11 +211,11 @@ class ProberService {
       response_time_ms: isSuccess ? responseTimeMs : 0,
       top_processes: []
     };
-    DB.saveMetrics(metricsPayload);
+    await DB.saveMetrics(metricsPayload);
     this.broadcast({ type: 'metrics_update', serverId: server.id, metrics: metricsPayload });
   }
 
-  checkAgentServer(server, offlineTimeout, now) {
+  async checkAgentServer(server, offlineTimeout, now) {
     const lastHeartbeat = server.last_heartbeat || 0;
     const timeSinceHeartbeat = now - lastHeartbeat;
     const oldStatus = server.status;
@@ -230,12 +230,12 @@ class ProberService {
     }
 
     if (newStatus !== oldStatus) {
-      DB.updateServerStatus(server.id, newStatus, lastHeartbeat);
+      await DB.updateServerStatus(server.id, newStatus, lastHeartbeat);
       this.broadcast({ type: 'server_status', serverId: server.id, status: newStatus });
 
       if (newStatus === 'offline' && oldStatus !== 'offline') {
         const details = `Tidak ada sinyal heartbeat selama ${Math.round(timeSinceHeartbeat / 1000)} detik`;
-        DB.createIncident(server.id, server.name, 'offline', details);
+        await DB.createIncident(server.id, server.name, 'offline', details);
         Notifier.sendAlert({
           serverId: server.id,
           serverName: server.name,
@@ -244,7 +244,7 @@ class ProberService {
           level: 'danger'
         });
       } else if (newStatus === 'online' && oldStatus === 'offline') {
-        DB.resolveIncident(server.id, 'offline');
+        await DB.resolveIncident(server.id, 'offline');
         Notifier.sendAlert({
           serverId: server.id,
           serverName: server.name,
